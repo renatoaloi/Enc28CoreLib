@@ -10,7 +10,6 @@
 
 #include "enc28.h"
 #include <Arduino.h>
-#include <MemoryFree.h>
 
 extern "C"
 {
