@@ -17,7 +17,7 @@ and hardware assisted DMA coping data between addresses.
 
 Unfortunately, the real implementation for PIC do not fit in ATMega328 hardware. 
 
-But I could manage to accommodate Microchip's concept inside W5100 library, as a hack.
+But I managed to accommodate Microchip's concept inside W5100 library, as a hack.
 This way, we could change between W5100 and ENC28J60 hardware without changes in
 Sketch's code: only changing between library cores.
 
