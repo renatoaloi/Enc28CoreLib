@@ -5,6 +5,8 @@
  * it under the terms of either the GNU General Public License version 2
  * or the GNU Lesser General Public License version 2.1, both as
  * published by the Free Software Foundation.
+ * 
+ * 2013-12-26 :: REV 1 by Renato Aloi (missing DHCP part)
  */
 
 
@@ -17,6 +19,15 @@ extern "C"
     #include "checksum.h"
 }
 
+// DO NOT TURN ON ANY DEBUG MACRO
+// when using EthernetSup
+#undef DEBUG_REV1
+#undef DEBUG_REV1_HEAVY
+
+#define DEBUG_REV1_LIGHT
+
+// See Rev 1 - Warn 1
+static unsigned char macHR = 0;
 
 // ENC28 controller instance
 ENC28Class ENC28;
@@ -25,19 +36,12 @@ ENC28Class ENC28;
 static unsigned     char        socketBuffer[MAX_BUFF_SIZE];
 static volatile     SocketVal   socket[MAX_SOCK_NUM];
 
-static unsigned char            lock = 0;
+static unsigned     int         serverSourcePort    = 0;
 
-static unsigned     char        _my_macaddr[]      = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
-static unsigned     char        _my_ipaddr[]       = { 0x00, 0x00, 0x00, 0x00 };
-static unsigned     char        _my_gataddr[]      = { 0x00, 0x00, 0x00, 0x00 };
-static unsigned     char        _my_subaddr[]      = { 0x00, 0x00, 0x00, 0x00 };
-
-static unsigned     char        oneTimeOpen        = 0;
-static unsigned     char        oneTimeListen      = 0;
-
-static unsigned     long        timerTimeout       = 0;
-static unsigned     long        timerTimeout2      = 0;
-static unsigned     long        timerTimeout3      = 0;
+static unsigned     char        _my_macaddr[]       = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+static unsigned     char        _my_ipaddr[]        = { 0x00, 0x00, 0x00, 0x00 };
+static unsigned     char        _my_gataddr[]       = { 0x00, 0x00, 0x00, 0x00 };
+static unsigned     char        _my_subaddr[]       = { 0x00, 0x00, 0x00, 0x00 };
 
 static TCP_PACKET               tcpPacket2;
 
@@ -55,18 +59,23 @@ static void writeSocketBufferBigEndian(unsigned char* buf, unsigned int size, un
 
 static uint8_t DealRXArrival(void);
 static void SendSynResponse(SOCKET i);
-static uint16_t SendAckResponse(SOCKET i);
-static void PreparePushRequest(SOCKET i, unsigned int _payload);
-static void SendPushRequest(SOCKET i, unsigned int _payload);
+
+// See Bug 1 Rev 1
+//static uint16_t SendAckResponse(SOCKET i);
+static uint16_t GetRequestPayload(SOCKET i);
+static void SendAckResponse(SOCKET i);
+static uint32_t GetRequestSeqNum(SOCKET i);
+static uint32_t GetRequestAckNum(SOCKET i);
+static uint16_t GetSourcePort(SOCKET i);
+
+// New funcs - See Bug 2 - Rev 1
+static void PrepareAckWithPayload(SOCKET i, unsigned int _payload);
+static void SendAckWithPayload(SOCKET i, unsigned int _payload);
+//
 static void SendFinRequest(SOCKET i);
 
 static void WaitForDMACopy(void);
 static void SendBufferTx(void);
-
-static uint8_t timeout(uint32_t delta);
-static uint8_t timeout2(uint32_t delta);
-static uint8_t timeout3(uint32_t delta);
-
 
 // Init Method
 //
@@ -97,9 +106,6 @@ void ENC28Class::init(void)
         InitSocket(i);
     }
     
-    oneTimeOpen        = 0;
-    oneTimeListen      = 0;
-    
     // Init ENC28J60
     MACInit(); 
 }
@@ -109,6 +115,8 @@ void ENC28Class::init(void)
 //
 uint8_t ENC28Class::readSnSR(SOCKET _s)
 {
+    if (_s >= MAX_SOCK_NUM) return 0;
+
     if (IsMACSendTx())
     {
         // Check if we have packets to treat
@@ -118,22 +126,9 @@ uint8_t ENC28Class::readSnSR(SOCKET _s)
         // Background Process
         //
         treatBackgroundProcesses();
-    }
-    
-    if (timeout(5000))
-    {
-        for (unsigned int i = 0; i < MAX_SOCK_NUM; i++)
-        {
-            socket[i].status = SnSR::CLOSED;
-        }
-        
-        timerTimeout = millis();
-        
-        // Restart ENC28
-        MACInit();
-        MACInitMacAddr((unsigned char*)&_my_macaddr);
-        MACOpen();
-        MACEnableRecv();
+
+        // Loop Counter
+        socket[_s].loopCounter++;
     }
     
     // return pre-processed socket status
@@ -144,7 +139,9 @@ uint8_t ENC28Class::readSnSR(SOCKET _s)
 //
 void ENC28Class::execCmdSn(SOCKET s, SockCMD _cmd)
 {
-    unsigned int my_payload = 0;
+    if (s >= MAX_SOCK_NUM) return;
+
+    
     switch(_cmd)
     {
         case Sock_RECV:
@@ -158,101 +155,123 @@ void ENC28Class::execCmdSn(SOCKET s, SockCMD _cmd)
             break;
         case Sock_SEND:
             // Send socket process -- must be first for performance stuff
-            
-            // clear flag
-            socket[s].myFlagACKFromPush = 0;
-            
-            // Calc size TX
-            my_payload = socket[s].ptrWrTx - (socket[s].startTx + TCP_BUFF_SIZE + 1);
-            
-            if (my_payload > 0)
-            {
-                // Assembly the packet
-                PreparePushRequest(s, my_payload);
-                
-                // and send it!
-                SendPushRequest(s, my_payload);
-                
-                // Put status internal for waiting
-                // for response ACK
-                socket[s].myFlagPSH = 1;
-                
-                // Reseting timeout
-                timerTimeout3 = millis();
-            }
-            
-            // Release lock
-            if (lock) lock = 0;
+
+#ifdef DEBUG_REV1_HEAVY
+            Serial.print("Sock_SEND: ");
+            Serial.println(millis());
+#endif
+
+            // Setting do send flag
+            socket[s].myFlagDoSend = 1;
+
+            // Clear Got Sync Ack flag
+            socket[s].myFlagGotSyncAck = 0;
+
+            // unlocking
+            socket[s].myFlagLock = 0;
             
             break;
         case Sock_OPEN:
             // Open socket process
+#ifdef DEBUG_REV1_HEAVY
+            Serial.println("Sock_OPEN");
+#endif
             
-            // Performing hardware init one time
-            if (!oneTimeOpen)
-            {
-                // Setting one time execution
-                oneTimeOpen++;
-                
-                // Call Open Func
-                MACOpen();
-                
-                // wait for stabilization
-                delay(10);
-            }
+            // See Rev 1 - Warn 1
+            // Now we can output Hardware version
+			macHR = MACHardwareRevision();
+			
+			// Debugging version for compatibility test
+#ifdef DEBUG_REV1
+            Serial.print("Ethernet Hardware Rev.: ");
+            Serial.println(macHR, DEC);
+#endif 
+
+#ifdef DEBUG_REV1_LIGHT
+            Serial.print("Ethernet Hardware Rev.: ");
+            Serial.println(macHR, DEC);
+#endif 
             
-            // Update socket status 
-            socket[s].status = SnSR::INIT;
+            // See Rev 1 - Warn 1
+            // Check version
+			if (macHR < 6) 
+			{
+#ifdef DEBUG_REV1
+                Serial.println("Version not compatible!");
+#endif
+
+#ifdef DEBUG_REV1_LIGHT
+                Serial.println("Version not compatible!");
+#endif
+				// FAIL! Version not compatible
+				// Need to be compatible with 
+				// ENC28J60 ERRATA Rev.B7
+				socket[s].status = SnSR::CLOSED;
+			}
+			else
+			{
+				// Update socket status 
+				socket[s].status = SnSR::INIT;
+			}
             
             break;
         case Sock_CLOSE:
             // Close socket process
-            
-            // Close for good
+#ifdef DEBUG_REV1_HEAVY
+            Serial.println("Sock_CLOSE");
+            Serial.print("Loop Counter: ");
+            Serial.println(socket[s].loopCounter);
+#endif
+            // Setting CLOSED status
             socket[s].status = SnSR::CLOSED;
-            
-            // Reseting size
-            socket[s].sizeRx = 0;
+
+            // unlocking
+            socket[s].myFlagLock = 0;
             
             break;
         case Sock_LISTEN:
             // Puts socket in a listening process
-            
-            // Performing hardware init one time
-            if (!oneTimeListen)
-            {
-                // Setting one time execution
-                oneTimeListen++;
-                
-                MACEnableRecv();
-            }
-            
-            // Reset Session
-            ClearSocket(s);
-            
+#ifdef DEBUG_REV1_HEAVY
+            Serial.println("Sock_LISTEN");
+#endif
+
             // Update socket status 
             socket[s].status = SnSR::LISTEN;
+
+            // Release lock
+            if (socket[s].myFlagLock) 
+                socket[s].myFlagLock = 0;
             
             break;
         case Sock_CONNECT:
             // Connect socket process
+#ifdef DEBUG_REV1_HEAVY
+            Serial.println("Sock_CONNECT");
+#endif
             
             break;
         case Sock_DISCON:
             // Disconnect socket process
+#ifdef DEBUG_REV1_HEAVY
+            Serial.println("Sock_DISCON");
+#endif
 
-            // Wait for Final ACK
-            socket[s].status = SnSR::CLOSE_WAIT;
-            
-            // Reseting size
-            socket[s].sizeRx = 0;
-            
-            // Sen Fin
-            SendFinRequest(s);
+            // Calling disconnect
+            socket[s].myFlagDiscon = 1;
+
+            socket[s].loopCounter = 0;
+
+            // Release lock
+            // we need to receive last
+            // ACK before go to close wait
+            if (socket[s].myFlagLock) socket[s].myFlagLock = 0;
             
             break;
         default:
-            // command nt implemented
+#ifdef DEBUG_REV1_HEAVY
+            Serial.println("Command not implemented!");
+#endif
+            // command not implemented
             break;
     }
 }
@@ -261,6 +280,8 @@ void ENC28Class::execCmdSn(SOCKET s, SockCMD _cmd)
 //
 void ENC28Class::send_data_processing(SOCKET s, const uint8_t *data, uint16_t len)
 {
+    if (s >= MAX_SOCK_NUM) return;
+
     send_data_processing_offset(s, 0, data, len);
 }
 
@@ -268,11 +289,14 @@ void ENC28Class::send_data_processing(SOCKET s, const uint8_t *data, uint16_t le
 //
 void ENC28Class::send_data_processing_offset(SOCKET s, uint16_t data_offset, const uint8_t *data, uint16_t len)
 {
+    if (s >= MAX_SOCK_NUM) return;
+
     socket[s].ptrWrTx = readSnTX_WR(s);
     socket[s].ptrWrTx += data_offset;
     
     // dont know why yet,
     // but only works this way
+	// Rev1: TODO for another Rev.
     unsigned char data2[len];
     for (unsigned int m=0; m<len; m++)
     {
@@ -281,11 +305,17 @@ void ENC28Class::send_data_processing_offset(SOCKET s, uint16_t data_offset, con
     
     // save len because it is decreased
     // at SOCKETWriterBuffer func.
-    // dont know if really works
+    // Old: dont know if really works
+	// Rev1: Yep, it works indeed!
     unsigned int savedLen = len;
     
     // we dont have circular socket's buffer
     // one write instruction will do
+	//
+	// Rev1: Instead of circular buffer, we use ENC28J60's
+	// Rev1: DMA buffer Copy to perform Zero-Copy operations.
+	// Rev1: See DMACopyTo() and DMACopyFrom() functions.
+	//
     //SOCKETWriteBuffer((unsigned char*)&data, len, socket[s].ptrWrTx);
     SOCKETWriteBuffer(data2, len, socket[s].ptrWrTx);
   
@@ -298,8 +328,10 @@ void ENC28Class::send_data_processing_offset(SOCKET s, uint16_t data_offset, con
 //
 void ENC28Class::recv_data_processing(SOCKET s, uint8_t *data, uint16_t len, uint8_t peek)
 {
+    if (s >= MAX_SOCK_NUM) return;
+
     // Always lock on reading
-    lock = 1;
+    socket[s].myFlagLock = 1;
     
     socket[s].ptrRdRx = readSnRX_RD(s);
     SOCKETReadBuffer(data, len, socket[s].ptrRdRx);
@@ -314,6 +346,8 @@ void ENC28Class::recv_data_processing(SOCKET s, uint8_t *data, uint16_t len, uin
 //
 uint16_t ENC28Class::getTXFreeSize(SOCKET s)
 {
+    if (s >= MAX_SOCK_NUM) return 0;
+
     return (socket[s].endTx - socket[s].ptrWrTx);
 }
 
@@ -323,6 +357,8 @@ uint16_t ENC28Class::getTXFreeSize(SOCKET s)
 //
 uint16_t ENC28Class::getRXReceivedSize(SOCKET s)
 {
+    if (s >= MAX_SOCK_NUM) return 0;
+
     return socket[s].sizeRx;
 }
 
@@ -330,6 +366,8 @@ uint16_t ENC28Class::getRXReceivedSize(SOCKET s)
 //
 uint8_t ENC28Class::readSnMR(SOCKET _s)
 {
+    if (_s >= MAX_SOCK_NUM) return 0;
+
     return 1;
 }
 
@@ -337,11 +375,23 @@ uint8_t ENC28Class::readSnMR(SOCKET _s)
 //
 uint8_t ENC28Class::readSnIR(SOCKET _s)
 {
-    // Set interrupt flag
-    if (socket[_s].myFlagACKFromPush)
-    {
-        
-        
+    if (_s >= MAX_SOCK_NUM) return 0;
+
+    if (socket[_s].myFlagSendOk)
+    { 
+#ifdef DEBUG_REV1_HEAVY
+        Serial.print("SEND_OK: ");
+        Serial.println(millis());
+#endif
+
+        // Advancing TX pointer
+        RecalcTxPointer(_s);
+
+        // Rev1: Lock because
+        // we must avoid ACK arriving
+        // when not in sending time
+        socket[_s].myFlagLock = 1;
+
         // Return flag expected
         return SnIR::SEND_OK;
     }
@@ -349,10 +399,25 @@ uint8_t ENC28Class::readSnIR(SOCKET _s)
     return 1;
 }
 
+// Write interrupt
+//
+void ENC28Class::writeSnIR(SOCKET _s, uint8_t _flag)
+{
+    if (_s >= MAX_SOCK_NUM) return;
+
+    // Clear interrupt flag
+    if (_flag == SnIR::SEND_OK)
+    {
+        socket[_s].myFlagSendOk = 0;
+    }
+}
+
 // Read Rx pointer
 //
 uint16_t ENC28Class::readSnRX_RD(SOCKET _s)
 {
+    if (_s >= MAX_SOCK_NUM) return 0;
+
     uint16_t p = SOCKETGetRxPointer();
     return p;
 }
@@ -361,21 +426,27 @@ uint16_t ENC28Class::readSnRX_RD(SOCKET _s)
 //
 uint16_t ENC28Class::readSnTX_WR(SOCKET _s)
 {
+    if (_s >= MAX_SOCK_NUM) return 0;
+
     uint16_t p = SOCKETGetTxPointer();
     return p;
 }
-
 
 // Write Rx pointer
 //
 void ENC28Class::writeSnRX_RD(SOCKET _s, uint16_t _addr)
 {
+    if (_s >= MAX_SOCK_NUM) return;
+
     SOCKETSetRxPointer(_addr);
 }
 
 // Write Tx Pointer
+//
 void ENC28Class::writeSnTX_WR(SOCKET _s, uint16_t _addr)
 {
+    if (_s >= MAX_SOCK_NUM) return;
+
     SOCKETSetTxPointer(_addr);
 }
 
@@ -383,17 +454,32 @@ void ENC28Class::writeSnTX_WR(SOCKET _s, uint16_t _addr)
 //
 void ENC28Class::writeSnMR(SOCKET _s, uint8_t _flag)
 {
+    if (_s >= MAX_SOCK_NUM) return;
+
+#ifdef DEBUG_REV1
+    Serial.print("MODE Flag (");
+    Serial.print(_flag == SnMR::TCP ? "TCP" : "OTHER");
+    Serial.println(") OK!");
+#endif
+
+#ifdef DEBUG_REV1_LIGHT
+    Serial.print("MODE Flag (");
+    Serial.print(_flag == SnMR::TCP ? "TCP" : "OTHER");
+    Serial.println(") OK!");
+#endif
     // 4.
     // Socket new instance
     // When socket define hardware mode
-    
     socket[_s].status   = SnSR::CLOSED;
-    
-    
+	
+	// Rev1: TODO Must create Issue to adjust
+	// Rev1: threading sockets.
+	// Rev1: W5100 lib does not thread processes, but...
     
     // Pointers to buffers ends and starts
     if (_flag == SnMR::TCP)
     {
+
         // TCP protocol
         if (_s == 0)
         {
@@ -413,30 +499,22 @@ void ENC28Class::writeSnMR(SOCKET _s, uint8_t _flag)
             socket[_s].ptrRdRx   = socket[_s].startRx;
             socket[_s].ptrWrTx   = socket[_s].startTx;
         }
-        // 8k of Enc28's buffer is too small
-        // for accomodate 4 sockets
-        /*else if (_s == 2)
-        {
-            socket[_s].startRx = SOCKET3_RX_START;
-            socket[_s].endRx   = SOCKET3_RX_END;
-            socket[_s].startTx = SOCKET3_TX_START;
-            socket[_s].endTx   = SOCKET3_TX_END;
-            socket[_s].ptrRdRx   = socket[_s].startRx;
-            socket[_s].ptrWrTx   = socket[_s].startTx;
-        }
-        else if (_s == 3)
-        {
-            socket[_s].startRx = SOCKET4_RX_START;
-            socket[_s].endRx   = SOCKET4_RX_END;
-            socket[_s].startTx = SOCKET4_TX_START;
-            socket[_s].endTx   = SOCKET4_TX_END;
-            socket[_s].ptrRdRx   = socket[_s].startRx;
-            socket[_s].ptrWrTx   = socket[_s].startTx;
-        }*/
         else
         {
             // Error max packets reached
         }
+
+        // Call Open Func
+        MACOpen();
+
+        // wait for stabilization
+        delay(10);
+
+        // Enabling reception                
+        MACEnableRecv();
+
+        // wait for stabilization
+        delay(10);  
     }
     else
     {
@@ -444,26 +522,28 @@ void ENC28Class::writeSnMR(SOCKET _s, uint8_t _flag)
     }
 }
 
-// Write interrupt
-//
-void ENC28Class::writeSnIR(SOCKET _s, uint8_t _flag)
-{
-    // Clear interrupt flag
-    if (_flag == SnIR::SEND_OK)
-    {
-        socket[_s].myFlagACKFromPush = 0;
-    }
-}
-
 // Write server port
 //
 void ENC28Class::writeSnPORT(SOCKET _s, uint16_t _addr)
 {
+    if (_s >= MAX_SOCK_NUM) return;
+
     // 5.
     // Set listening port
-    
-    //serverSourcePort  = _addr;
-    
+
+    serverSourcePort  = _addr;
+
+#ifdef DEBUG_REV1
+    Serial.print("OPEN Port (");
+    Serial.print(serverSourcePort);
+    Serial.println(") OK!");
+#endif
+
+#ifdef DEBUG_REV1_LIGHT
+    Serial.print("OPEN Port (");
+    Serial.print(serverSourcePort);
+    Serial.println(") OK!");
+#endif
 }
 
 // Get Ip address
@@ -594,7 +674,6 @@ void ENC28Class::setRetransmissionCount(uint8_t _retry)
   // not implemented
 }
 
-
 /***************************************************************************
  * STATIC LOCAL FUNCTIONS
  ***************************************************************************/
@@ -604,255 +683,312 @@ void ENC28Class::setRetransmissionCount(uint8_t _retry)
 //
 static void readSocketPackets(void)
 {
-    if (MACGetPacketCount() > 0 && !lock)
+    // Rev 1
+    // can we discard packet?
+    // during BUG's correction
+    // this technique worked at some point
+    // but I think it is not necessary anymore
+    unsigned char canDiscard = 1;
+
+    if (MACGetPacketCount() > 0) 
     {
-        timerTimeout = millis();
-        
-        // Deal with incomming packets
+        // Deal with incoming packets
         // Returns true if TCP packet arrived
         // and is my IP address
         if (DealRXArrival())
         {
-            // Load TCP struct With Options
-            readBufferLittleEndian(socketBuffer, TCP_BUFF_SIZE);
-            tcpPacket2 = (TCP_PACKET&)socketBuffer;
-    
-            // Cycling through sockets to accomodate
+            // If we got here, means:
+            // a. IP destination address is our IP address
+            // b. Destination Port is serverPort (normally 80)
+            // So, we already have Dest IP and Port confirmed for us!
+
+            // Cycling through sockets to accommodate
             // arrived packet
             for (unsigned int i = 0; i < MAX_SOCK_NUM; i++)
             {
-                if (socket[i].status == SnSR::LISTEN)
+                if (socket[i].myFlagLock)
                 {
-                    // If socket is in listen state,
-                    // we accept FIN, SYN and PSH flags
-                    
-                    // If SYN, register session port!
-                    // and send SYN/ACK back
-                    if (tcpPacket2.tcp.Flags.Bits.FlagSYN)
-                    {
-                        // Take care just if new socket
-                        //
-                        if (socket[i].sessionPort == 0 )
-                        {
-                            // Copy packet from
-                            // ENC28J60's RX buffer to socket RX buffer
-                            // With options 'cause we send
-                            // MMS option along with SYN/ACK
-                            DMACopyTo(RX, socket[i].startRx, TCP_BUFF_SIZE_W_OPT);
-                            
-                            WaitForDMACopy();
-                            
-                            // Bind session port
-                            socket[i].sessionPort = tcpPacket2.tcp.SourcePort;
-                            
-                            // Set My Flag to respond
-                            socket[i].myFlagSYN = 1;
-                            
-                            // Mark to Send response
-                            socket[i].pending = 1;
-                            
-                            // stop searching sockets to attend
-                            // this request already been treated
-                            break;
-                        }
-                    }
-                    else if (tcpPacket2.tcp.Flags.Bits.FlagPSH
-                             && !tcpPacket2.tcp.Flags.Bits.FlagFIN)
-                    {
-                        // If already got a syn,
-                        // means we ready to go established
-                        if (socket[i].sessionPort == tcpPacket2.tcp.SourcePort )
-                        {
-                            // Copy packet from
-                            // ENC28J60's RX buffer to socket RX buffer
-                            DMACopyTo(RX, socket[i].startRx, tcpPacket2.ip.TotalLength.Value + ETH_BUFF_SIZE);
-                            
-                            WaitForDMACopy();
-                            
-                            // Set My Flag to respond
-                            socket[i].myFlagPSHACK = 1;
-                            
-                            // Mark to Send response
-                            socket[i].pending = 1;
-                            
-                            // stop searching sockets to attend
-                            // this request already been treated
-                            break;
-                        }
-                    }
-                    else if (tcpPacket2.tcp.Flags.Bits.FlagFIN)
-                    {
-                        // If already got a syn,
-                        // means we cant respond to another ports
-                        // so only respond to FINs before
-                        // sessionPort being set
-                        if (socket[i].sessionPort == 0 )
-                        {
-                            // Copy packet from
-                            // ENC28J60's RX buffer to socket RX buffer
-                            DMACopyTo(RX, socket[i].startRx, TCP_BUFF_SIZE);
-                            
-                            WaitForDMACopy();
-                            
-                            // Set My Flag to respond
-                            socket[i].myFlagFIN = 1;
-                            
-                            // Mark to Send response
-                            socket[i].pending = 1;
-                            
-                            // stop searching sockets to attend
-                            // this request already been treated
-                            break;
-                        }
-                    }
-                    
+                    canDiscard = 0;
+                    break;
                 }
-                else if (socket[i].status == SnSR::ESTABLISHED)
+                else
                 {
-                    // If socket is in established state
-                    // we accept ACK and FIN flags
-                    
-                    // But only if port is in session
-                    if (socket[i].sessionPort == tcpPacket2.tcp.SourcePort)
+                    if (socket[i].status == SnSR::LISTEN)
                     {
-                        if (tcpPacket2.tcp.Flags.Bits.FlagFIN )
+#ifdef DEBUG_REV1_HEAVY
+                        Serial.println("SnSR::LISTEN");
+#endif
+                        // REV 1 - Revision on 
+                        // reading and backgrounding processes
+                        // ... in the end, the sending process 
+                        // was the real pain in back ...
+
+                        // Session treatment
+                        // Check for final ACK for SYN handshaking
+                        if (tcpPacket2.tcp.SourcePort == socket[i].sessionPort)
                         {
-                            // Copy packet from
-                            // ENC28J60's RX buffer to socket RX buffer
-                            DMACopyTo(RX, socket[i].startRx, TCP_BUFF_SIZE);
-                            
-                            WaitForDMACopy();
-                            
-                            // Set My Flag to respond
-                            socket[i].myFlagFIN = 1;
-                            
-                            // Mark to Send response
-                            socket[i].pending = 1;
-                            
-                            // stop searching sockets to attend
-                            // this request already been treated
-                            break;
-                        }
-                        else if (tcpPacket2.tcp.Flags.Bits.FlagACK)
-                        {
-                            // If waiting for Ack
-                            // in response for our own Push
-                            if (socket[i].myFlagPSH)
+                            if (tcpPacket2.tcp.Flags.Bits.FlagACK
+                                && tcpPacket2.tcp.Flags.Bits.FlagPSH
+
+                                && !tcpPacket2.tcp.Flags.Bits.FlagFIN
+                                )
                             {
-                                // Clear flag
-                                socket[i].myFlagPSH = 0;
-                                
-                                // Lock again
-                                if (!lock) lock = 1;
-                                
+                                // Going established
+                                socket[i].myFlagEstablished = 1;
+
+                                // Copy packet from
+                                // ENC28J60's RX buffer to socket RX buffer
+                                DMACopyTo(RX, socket[i].startRx, tcpPacket2.ip.TotalLength.Value + ETH_BUFF_SIZE);
+                                WaitForDMACopy();
+
+                                // stop searching sockets to attend
+                                // this request will be deal at background time
+                                break;
+                            }
+                            else if (tcpPacket2.tcp.Flags.Bits.FlagFIN 
+                                    && tcpPacket2.tcp.Flags.Bits.FlagACK )
+                            {
+                                    
+                                // Setting flag to send final ACK
+                                socket[i].myFlagSendFinalACK = 1;
+#ifdef DEBUG_REV1_HEAVY
+                                Serial.println("FIN OUT OF REASON - SESSION");
+#endif
                                 // Copy packet from
                                 // ENC28J60's RX buffer to socket RX buffer
                                 DMACopyTo(RX, socket[i].startRx, TCP_BUFF_SIZE);
-                                
                                 WaitForDMACopy();
+
+                                socket[i].seqNumForSending = GetRequestAckNum(i);
+                                socket[i].ackNumForSending = GetRequestSeqNum(i);
+
+                                // Bind session port
+                                socket[i].sessionPort = tcpPacket2.tcp.SourcePort;
+
+                                // Put socket in waiting for close status
+                                // we have 1 second to close it!
+                                // the W5100 socket has this config
+                                // hard coded
+                                socket[i].status = SnSR::CLOSE_WAIT;
+
+                                // We need to lock
+                                // because we sending 
+                                // a group of packets
+                                if (!socket[i].myFlagLock) socket[i].myFlagLock = 1;
+
+                                // stop searching sockets to attend
+                                // this request will be deal at background time
+                                break;
+                                        
+                                    
+                            }
+                        }
+
+
+                        // Free treatment
+                        // Receive a SYN and bind source port
+                        else 
+                        {
+                            // Checking if is really a new session
+                            // or just the client trying to open
+                            // lot of source ports!
+                            //
+                            if (socket[i].sessionPort == 0)
+                            {
+                                if (tcpPacket2.tcp.Flags.Bits.FlagSYN)
+                                {
+                                    // Ok, actual port is different from session,
+                                    // sending SYN and making this our new session port
+                                    socket[i].myFlagNewSession = 1;
+
+                                    // Bind session port
+                                    socket[i].sessionPort = tcpPacket2.tcp.SourcePort;
+
+                                    // Copy packet from
+                                    // ENC28J60's RX buffer to socket RX buffer
+                                    // With options 'cause we send
+                                    // MMS option along with SYN/ACK
+                                    DMACopyTo(RX, socket[i].startRx, TCP_BUFF_SIZE_W_OPT);
+                                    WaitForDMACopy();
+
+                                    // stop searching sockets to attend
+                                    // this request will be deal at background time
+                                    break;
+                                }
                                 
-                                // Set My Flag to respond
-                                socket[i].myFlagACKFromPush = 1;
                                 
-                                // Mark to Send response
-                                //socket[i].pending = 1;
+                                else 
+                                {
+                                    if (!tcpPacket2.tcp.Flags.Bits.FlagRST)
+                                    {
+                                        // Setting flag to send final ACK
+                                        socket[i].myFlagSendFinalACK = 1;
+#ifdef DEBUG_REV1_HEAVY
+                                        Serial.println("FIN OUT OF REASON");
+#endif
+                                        // Copy packet from
+                                        // ENC28J60's RX buffer to socket RX buffer
+                                        DMACopyTo(RX, socket[i].startRx, TCP_BUFF_SIZE);
+                                        WaitForDMACopy();
+
+                                        socket[i].seqNumForSending = GetRequestAckNum(i);
+                                        socket[i].ackNumForSending = GetRequestSeqNum(i);
+
+                                        // Bind session port
+                                        socket[i].sessionPort = tcpPacket2.tcp.SourcePort;
+
+                                        // Put socket in waiting for close status
+                                        // we have 1 second to close it!
+                                        // the W5100 socket has this config
+                                        // hard coded
+                                        socket[i].status = SnSR::CLOSE_WAIT;
+
+                                        // We need to lock
+                                        // because we sending 
+                                        // a group of packets
+                                        if (!socket[i].myFlagLock) socket[i].myFlagLock = 1;
+
+                                        // stop searching sockets to attend
+                                        // this request will be deal at background time
+                                        break;
+                                    }
+                                }
                                 
-                                // Recalc Tx pointer
-                                RecalcTxPointer(i);
                                 
+                            }
+                        }
+                        
+                    }
+                    else if (socket[i].status == SnSR::ESTABLISHED)
+                    {
+
+
+                        // Session treatment
+                        // Receive a PSH for session port
+                        // Also treat control ACK's for sent packets
+                        if (tcpPacket2.tcp.SourcePort == socket[i].sessionPort)
+                        {
+                            if (tcpPacket2.tcp.Flags.Bits.FlagACK
+                                && !tcpPacket2.tcp.Flags.Bits.FlagPSH)
+                            {
+                                // Copy packet from
+                                // ENC28J60's RX buffer to socket RX buffer
+                                DMACopyTo(RX, socket[i].startRx, TCP_BUFF_SIZE);
+                                WaitForDMACopy();
+
+                                // Rev 1
+                                // Sync ACK only when seq number 
+                                // is greather than previous one
+                                if (GetRequestAckNum(i) > socket[i].seqNumForSending)
+                                {
+                                    socket[i].seqNumForSending = GetRequestAckNum(i);
+                                    socket[i].ackNumForSending = GetRequestSeqNum(i);
+
+#ifdef DEBUG_REV1_HEAVY
+                                    Serial.print("SnSR::ESTABLISHED: ");
+                                    Serial.println(millis());
+                                    Serial.print("ACK Num FS: ");
+                                    Serial.println(socket[i].ackNumForSending);
+                                    Serial.print("SEQ Num FS: ");
+                                    Serial.println(socket[i].seqNumForSending);
+#endif
+
+                                    // Set My Flag to respond
+                                    socket[i].myFlagGotSyncAck = 1;
+
+                                    // Set Send OK flag
+                                    socket[i].myFlagSendOk = 1;
+
+                                    // Turn off waiting 
+                                    // for sync ack
+                                    socket[i].myFlagWaitForSyncAck = 0;
+
+                                    // Clear last payload
+                                    socket[i].previousPayloadForSending = 0;
+                                }
+
                                 // stop searching sockets to attend
                                 // this request already been treated
                                 break;
                             }
                         }
-                    }
-                }
-                else if (socket[i].status == SnSR::CLOSE_WAIT)
-                {
-                    // If socket in this state,
-                    // we accept only FIN
+                        // Free treatment
+                        // N/A
                         
-                    // But only if port is in session
-                    if (socket[i].sessionPort == tcpPacket2.tcp.SourcePort)
-                    {
-                        if (tcpPacket2.tcp.Flags.Bits.FlagFIN  )
-                        {
-                            // Copy packet from
-                            // ENC28J60's RX buffer to socket RX buffer
-                            DMACopyTo(RX, socket[i].startRx, TCP_BUFF_SIZE);
-                            
-                            WaitForDMACopy();
-                            
-                            // Set My Flag to respond
-                            socket[i].myFlagFIN = 1;
-                            
-                            // Mark to Send response
-                            socket[i].pending = 1;
-                            
-                            // stop searching sockets to attend
-                            // this request already been treated
-                            break;
-                        }
                     }
-                }
-                else // CLOSED 
-                {
-                    // If socket in this state,
-                    // we accept only ACK in response to a FIN
-                        
-                    // But only if port is in session
-                    if (socket[i].sessionPort == tcpPacket2.tcp.SourcePort)
+                    else if (socket[i].status == SnSR::CLOSE_WAIT)
                     {
-                        if (tcpPacket2.tcp.Flags.Bits.FlagACK)
+#ifdef DEBUG_REV1_HEAVY
+                        Serial.println("SnSR::CLOSE_WAIT");
+#endif
+                        // Session treatment
+                        // check for last ACK at session port
+                        if (tcpPacket2.tcp.SourcePort == socket[i].sessionPort)
                         {
-                            // Clear Session
-                            ClearSocket(i);
-                            
-                            // stop searching sockets to attend
-                            // this request already been treated
-                            break;
+                            if (tcpPacket2.tcp.Flags.Bits.FlagFIN
+                                && tcpPacket2.tcp.Flags.Bits.FlagACK
+                                )
+                            {
+                                // Copy packet from
+                                // ENC28J60's RX buffer to socket RX buffer
+                                DMACopyTo(RX, socket[i].startRx, TCP_BUFF_SIZE);
+                                WaitForDMACopy();
+
+                                // See Rev 1 - Bug 1
+                                // Setting SEQ/ACK numbers
+                                // 
+                                // When we got an ACK we dont need
+                                // to calculate SEQ/ACK numbers,
+                                // we just retrieve it from DMA buffer!
+                                //
+                                socket[i].seqNumForSending = GetRequestAckNum(i);
+                                socket[i].ackNumForSending = GetRequestSeqNum(i);
+
+                                // Set My Flag to respond
+                                socket[i].myFlagSendCloseACK = 1;
+
+                                // stop searching sockets to attend
+                                // this request already been treated
+                                break;
+                            }
                         }
-                        else if (tcpPacket2.tcp.Flags.Bits.FlagFIN)
+
+                        // Free treatment
+                        // N/A
+                    }
+                    else // CLOSED 
+                    {
+#ifdef DEBUG_REV1_HEAVY
+                        if (socket[i].status != SnSR::CLOSED)
                         {
-                            // Send Ack in response
-                            // Copy packet from
-                            // ENC28J60's RX buffer to socket RX buffer
-                            DMACopyTo(RX, socket[i].startRx, TCP_BUFF_SIZE);
-                            
-                            WaitForDMACopy();
-                            
-                            // Set My Flag to respond
-                            socket[i].myFlagFIN = 1;
-                            
-                            // Mark to Send response
-                            socket[i].pending = 1;
-                            
-                            // stop searching sockets to attend
-                            // this request already been treated
-                            break;
+                            Serial.print("Status = ");
+                            Serial.println(socket[i].status);
                         }
+                        else
+                        {
+                            Serial.println("SnSR::CLOSED");
+                        }
+#endif
+
+                        // Session treatment
+                        // Send RST to indicate this session is over!
+                        // cant reproduce this BUG... 
+                        // TODO to another REV
+
+                        // Free treatment
+                        // N/A
+
                     }
                 }
             }
         }
         
         // Release packet
-        MACDiscardRx();
+        if (canDiscard) MACDiscardRx();
     }
 }
 
-// Put Tx pointer 54 positions forward
-// to avoid TCP Head area
-//
-static void RecalcTxPointer(SOCKET i)
-{
-    // After confirming sending, recalc tx pointer
-    // Set TX pointer position
-    socket[i].ptrWrTx = socket[i].startTx + TCP_BUFF_SIZE + 1;
-    
-    // Configuring socket writer TX pointer
-    SOCKETSetTxPointer(socket[i].ptrWrTx);
-}
+
 
 // Background tasks
 // Some things cant be accomplished at time
@@ -864,200 +1000,273 @@ static void treatBackgroundProcesses(void)
     // pending tasks
     for (unsigned int i = 0; i < MAX_SOCK_NUM; i++)
     {
-        // If background flag 
-        if (socket[i].pending)
+        if (socket[i].myFlagNewSession)
         {
-            // Check for flag
-            if (socket[i].myFlagSYN)
-            {
-                // Clear flag but not the pending
-                socket[i].myFlagSYN = 0;
-                
-                // Send response
-                SendSynResponse(i);
-                
-                // Set timeout for the session
-                timerTimeout = millis();
-            }
-            else if (socket[i].myFlagPSHACK)
-            {
-                // Clear flag but not the pending
-                socket[i].myFlagPSHACK = 0;
-                
-                // Clear size
-                socket[i].sizeRx = 0;
-                
-                unsigned int payload = SendAckResponse(i);
-                
-                // Put socket in established status
-                socket[i].status = SnSR::ESTABLISHED;
-                
-                // Set pointers positions
-                socket[i].ptrRdRx = socket[i].startRx + TCP_BUFF_SIZE;// + RXD_STATUS_VECTOR_SIZE;
-                
-                // Calc. endRx pointer
-                if ((socket[i].ptrRdRx + payload) <= SOCKET_RX_END(i))
-                    socket[i].endRx   = (socket[i].ptrRdRx + payload);
-                else
-                    socket[i].endRx   = SOCKET_RX_END(i);
-                    
-                // Configuring socket reader RX pointer
-                SOCKETSetRxPointer(socket[i].ptrRdRx);
-                
-                // Recalc Tx Pointer
-                RecalcTxPointer(i);
-                
-                // we must lock for reading
-                lock = 1;
-                
-                // Release the kraken!
-                socket[i].sizeRx = payload;
-                
-                break;
-            }
-            else if (socket[i].myFlagFIN)
-            {
-                // Clear flag but not the pending
-                socket[i].myFlagFIN = 0;
-                
-                SendAckResponse(i);
-                
-                // Put socket in closed state
-                socket[i].status = SnSR::CLOSED;
-                
-                socket[i].sizeRx = 0;
-            }
+#ifdef DEBUG_REV1
+            Serial.println("myFlagNewSession");
+            Serial.print("New Port: ");
+            Serial.println(GetSourcePort(i));
+            Serial.print("Socket: ");
+            Serial.println(i);
+#endif
+            // reset flag
+            socket[i].myFlagNewSession = 0;
+
+            // treating flag
+            // Send response
+            SendSynResponse(i);
+
+            // stop searching sockets to attend
+            // this request already been treated
+            break;
+        }
+        else if (socket[i].myFlagEstablished)
+        {
+#ifdef DEBUG_REV1
+            Serial.println("myFlagEstablished");
+#endif
+            // reset flag
+            socket[i].myFlagEstablished = 0;
+
+            // First things, first
+            // Configuring reading buffer
+            // before go established
+
+            // Clear RX size
+            socket[i].sizeRx = 0;
+
+            // Get client's payload
+            socket[i].requestPayload = GetRequestPayload(i);
+
+            // Bug 1 - Rev 1 Revisited
+            // That's ok to send an ACK now
+            // We just need to keep track of
+            // SEQ and ACK numbers.
+            // Already inverting ACK/SEQ numbers
+            socket[i].seqNumForSending = GetRequestAckNum(i);
+            socket[i].ackNumForSending = (uint32_t)(GetRequestSeqNum(i) + socket[i].requestPayload);
+            socket[i].previousPayloadForSending = 0;
+
+            // And sending ACK with no payload
+            SendAckResponse(i);
+
+            // Put socket in stablished
+            // status
+            socket[i].status = SnSR::ESTABLISHED;
+            
+            // Set pointers positions
+            socket[i].ptrRdRx = socket[i].startRx + TCP_BUFF_SIZE;
+            // Calc. endRx pointer
+            if ((socket[i].ptrRdRx + socket[i].requestPayload) <= SOCKET_RX_END(i))
+                socket[i].endRx   = (socket[i].ptrRdRx + socket[i].requestPayload);
             else
+                socket[i].endRx   = SOCKET_RX_END(i);
+                
+            // Configuring socket reader RX pointer
+            SOCKETSetRxPointer(socket[i].ptrRdRx);
+            
+            // Recalc Tx Pointer
+            RecalcTxPointer(i);
+            
+            // we must lock for reading
+            socket[i].myFlagLock = 1;
+            
+            // Release the kraken!
+            // Rev 1:
+            // Appears to be redunctant
+            // but sizeRx is decreased and
+            // sometimes we need the original
+            // request payload's size.
+            socket[i].sizeRx = socket[i].requestPayload;
+            
+            // stop searching sockets to attend
+            // this request already been treated
+            break;
+        }
+        // Old: Granting with myFlagSendOk
+        // Old: we mess up with send already gone OK! (????)
+        //
+        // Rev1:
+        // Changed everything to only one flag DoSend 
+        //
+        else if (socket[i].myFlagDoSend) 
+        {
+            unsigned int payloadForSending = 0;
+
+#ifdef DEBUG_REV1_HEAVY
+            Serial.print("myFlagDo(ing)Send: ");
+            Serial.println(millis());
+#endif
+            // Clear Flag
+            socket[i].myFlagDoSend = 0;
+
+            // Do Send
+            // Calc size TX
+            payloadForSending = socket[i].ptrWrTx - (socket[i].startTx + TCP_BUFF_SIZE + 1);
+
+            // Preparing ACK/SEQ numbers
+            if (socket[i].previousPayloadForSending > 0)
             {
-                if (socket[i].myFlagPSH && socket[i].status == SnSR::ESTABLISHED
-                    && timeout3(1000) && !socket[i].myFlagACKFromPush)
-                {
-                    // Calc size TX
-                    unsigned int my_payload = socket[i].ptrWrTx - (socket[i].startTx + TCP_BUFF_SIZE + 1);
-                    
-                    // send push again!
-                    SendPushRequest(i, my_payload);
-                    
-                    // Put status internal for waiting
-                    // for response ACK
-                    socket[i].myFlagPSH = 1;
-                    
-                    timerTimeout3 = millis();
-                }
+                socket[i].seqNumForSending += socket[i].previousPayloadForSending;
             }
+            socket[i].previousPayloadForSending = payloadForSending;
+
+            if (payloadForSending > 0)
+            {
+                PrepareAckWithPayload(i, payloadForSending);
+                SendAckWithPayload(i, payloadForSending);
+            }
+
+            // And do few more loops
+            // before set myFlagFoundNoSyncAck
+
+            // Setting wait for 
+            // sync ack flag 
+            socket[i].myFlagWaitForSyncAck = 1;
+            
+            // Clear counter
+            socket[i].loopCounter = 0;
+
+            // stop searching sockets to attend
+            // this request already been treated
+            break;
+            
+            
+        }
+        else if (socket[i].myFlagWaitForSyncAck)
+        {
+            // not now, do more loops 
+            // before consider it done
+            if (socket[i].loopCounter > 50)
+            {
+#ifdef DEBUG_REV1_HEAVY
+                Serial.print("myFlagFoundNoSyncAck: ");
+                Serial.println(millis());
+#endif
+                // reset flag
+                socket[i].myFlagWaitForSyncAck = 0;
+
+                // Clear counter
+                socket[i].loopCounter = 0;
+
+                // Setting flag telling
+                // server to send more data.
+                // This means we did N loops
+                // and found no synch ACK
+                socket[i].myFlagFoundNoSyncAck = 1;
+
+                // Set Send OK flag
+                socket[i].myFlagSendOk = 1;
+            }
+
+            // stop searching sockets to attend
+            // this request already been treated
+            break;
+        }
+        else if (socket[i].myFlagSendFinalACK)
+        {
+#ifdef DEBUG_REV1_HEAVY
+            Serial.println("myFlagSendFinalACK");
+#endif
+            // reset flag
+            socket[i].myFlagSendFinalACK = 0;
+
+            // Just send an ACK
+            SendAckResponse(i);
+
+            // And schedule a flag for
+            // sending FIN/ACK along 
+            // with this last ACK
+            socket[i].myFlagSendFinalFIN = 1;
+
+            // We must hold the lock
+            // We dont want packets
+            // arriving while we sending last ACK
+            // and just after we will send FIN/ACK
+            if (!socket[i].myFlagLock) 
+                socket[i].myFlagLock = 1;
+
+            // stop searching sockets to attend
+            // this request already been treated
+            break;
+        }
+        else if (socket[i].myFlagSendFinalFIN)
+        {
+#ifdef DEBUG_REV1_HEAVY
+            Serial.println("myFlagSendFinalFIN");
+#endif
+            // reset flag
+            socket[i].myFlagSendFinalFIN = 0;
+
+            // Just send the FIN
+            SendFinRequest(i);
+
+            // Then release the lock
+            if (socket[i].myFlagLock) socket[i].myFlagLock = 0;
+
+            // stop searching sockets to attend
+            // this request already been treated
+            break;
+        }
+        else if (socket[i].myFlagDiscon && socket[i].myFlagGotSyncAck) 
+        {
+#ifdef DEBUG_REV1
+            Serial.println("myFlagDiscon");
+#endif
+            // Put socket in waiting for close status
+            // we have 1 second to close it!
+            // the W5100 socket has this config
+            // hard coded
+            socket[i].status = SnSR::CLOSE_WAIT;
+
+            // reset the flag
+            socket[i].myFlagDiscon = 0;
+
+            // Setting flag to send final ACK
+            socket[i].myFlagSendFinalACK = 1;
+
+            // We need to lock
+            // because we sending 
+            // a group of packets
+            if (!socket[i].myFlagLock) socket[i].myFlagLock = 1;
+
+            // stop searching sockets to attend
+            // this request already been treated
+            break;
+        }
+        else if (socket[i].myFlagSendCloseACK)
+        {
+#ifdef DEBUG_REV1_HEAVY
+            Serial.print("myFlagSendCloseACK: ");
+            Serial.println(millis());
+#endif
+            // reset the flag
+            socket[i].myFlagSendCloseACK = 0;
+
+            // SEQ and ACK numbers are ok already,
+            // but we need to add 1 to ACK number
+            socket[i].ackNumForSending++;
+
+            // Just send the final ACK
+            SendAckResponse(i);
+
+            // Close socket for good
+            socket[i].status = SnSR::CLOSED;
+
+            // Release the session!
+            // By releasing the port!
+            ClearSocket(i);
+
+            // release the lock 
+            // if its the case
+            if (socket[i].myFlagLock) socket[i].myFlagLock = 0;
+
+            // stop searching sockets to attend
+            // this request already been treated
+            break;
         }
     }
 }
-
-// Init SocketVal struct
-//
-static void InitSocket(SOCKET i)
-{
-    socket[i].ptrRdRx   = 0;
-    socket[i].ptrWrTx   = 0;
-    
-    socket[i].startRx   = 0;
-    socket[i].endRx     = 0;
-    socket[i].startTx   = 0;
-    socket[i].endTx     = 0;
-    
-    socket[i].idNum     = 322;
-    
-    socket[i].status = SnSR::CLOSED;
-    socket[i].sizeRx = 0;
-    socket[i].pending = 0;
-    socket[i].myFlagSYN = 0;
-    socket[i].myFlagFIN = 0;
-    socket[i].myFlagPSH = 0;
-    socket[i].myFlagPSHACK = 0;
-    socket[i].myFlagACKFromPush = 0;
-    socket[i].sessionPort = 0;
-    
-}
-
-// Clear session part from SocketVal struct
-//
-static void ClearSocket(SOCKET i)
-{
-    socket[i].status = SnSR::CLOSED;
-    socket[i].sizeRx = 0;
-    socket[i].pending = 0;
-    socket[i].myFlagSYN = 0;
-    socket[i].myFlagFIN = 0;
-    socket[i].myFlagPSH = 0;
-    socket[i].myFlagPSHACK = 0;
-    socket[i].myFlagACKFromPush = 0;
-    socket[i].sessionPort = 0;
-    
-    lock = 0;
-}
-
-// Read and invert ENC28's RX buffer
-// This method mirror the buffer to swap
-// big endian integers in little endian
-//
-static void readBufferLittleEndian(unsigned char* buf, unsigned int size)
-{
-    unsigned char tmpBuf[size];
-    
-    MACReadRXBuffer(tmpBuf, size);
-    
-    for (unsigned int k = 0; k < size; k++)
-    {
-        buf[k] = tmpBuf[size - k - 1];
-    }
-}
-
-// Read and invert Socket RX buffer
-// This method mirror the buffer to swap
-// big endian integers in little endian
-//
-static void readSocketBufferLittleEndian(unsigned char* buf, unsigned int size, unsigned int start)
-{
-    unsigned char tmpBuf[size];
-    
-    SOCKETReadBuffer(tmpBuf, size, start);
-    
-    for (unsigned int k = 0; k < size; k++)
-    {
-        buf[k] = tmpBuf[size - k - 1];
-    }
-}
-
-// Read and invert Socket RX buffer
-// This method mirror the buffer to swap
-// big endian integers in little endian
-//
-static void writeSocketBufferBigEndian(unsigned char* buf, unsigned int size, unsigned int start)
-{
-    unsigned char tmpBuf[size];
-    
-    for (unsigned int k = 0; k < size; k++)
-    {
-        tmpBuf[k] = buf[size - k - 1];
-    }
-    
-    SOCKETWriteBuffer(tmpBuf, size, start);
-}
-
-
-// Write and invert TX buffer
-// This method mirror the buffer to swap 
-// little endian integers back into big endian
-//
-static void writeBufferBigEndian(unsigned char* buf, unsigned int size)
-{
-    unsigned char tmpBuf[size];
-    
-    for (unsigned int k = 0; k < size; k++)
-    {
-        tmpBuf[k] = buf[size - k - 1];
-    }
-    
-    MACWriteTXBuffer(tmpBuf, size);
-}
-
-
 
 
 // First arrival treatment
@@ -1249,14 +1458,50 @@ static uint8_t DealRXArrival(void)
                         && ipPacket.ip.DestIp4 == _my_ipaddr[3]
                     )
                     {
-                        // so return true
-                        return 1;
+                        // Rev 1 - Bug No Server Port
+                        //
+                        // Load TCP struct With Options
+                        readBufferLittleEndian(socketBuffer, TCP_BUFF_SIZE);
+                        tcpPacket2 = (TCP_PACKET&)socketBuffer;
+                        // Checking if port checks!
+                        if (tcpPacket2.tcp.DestPort == serverSourcePort)
+                        {
+                            // so return true
+                            return 1;
+                        }
+                        else
+                        {
+                            // Port not open for listening
+#ifdef DEBUG_REV1
+                            Serial.print("Port (");
+                            Serial.print(tcpPacket2.tcp.DestPort);
+                            Serial.println(") not open for listening!");
+                            Serial.print("Try: ");
+                            Serial.println(serverSourcePort);
+#endif
+                        }
+                    }
+                    else
+                    {
+#ifdef DEBUG_REV1
+                        Serial.print("IP (");
+                        Serial.print(ipPacket.ip.DestIp1);
+                        Serial.print(".");
+                        Serial.print(ipPacket.ip.DestIp2);
+                        Serial.print(".");
+                        Serial.print(ipPacket.ip.DestIp3);
+                        Serial.print(".");
+                        Serial.print(ipPacket.ip.DestIp4);
+                        Serial.println(") not configured for this interface!");
+#endif
                     }
                 }
                 else
                 {
                     // Protocol not implemented
-                    
+#ifdef DEBUG_REV1_HEAVY
+                    Serial.print("Protocol not implemented!");
+#endif
                 }
             }
         }
@@ -1267,6 +1512,7 @@ static uint8_t DealRXArrival(void)
     // nothing else to do, return false
     return 0;
 }
+
 
 // Send SYN/ACK response for SYN
 //
@@ -1380,15 +1626,156 @@ static void SendSynResponse(SOCKET i)
     SendBufferTx();
 }
 
+// New func - See Bug 2 - Rev 1
+// Prepare ACK with payload to send it through socket
+//
+static void PrepareAckWithPayload(SOCKET i, unsigned int _payload)
+{
+	// Load TCP struct
+	readSocketBufferLittleEndian(socketBuffer, TCP_BUFF_SIZE, socket[i].startRx);
+	tcpPacket2 = (TCP_PACKET&)socketBuffer;
+	
+	// ETH Part
+	tcpPacket2.eth.DestMac1 = tcpPacket2.eth.SrcMac1;
+	tcpPacket2.eth.DestMac2 = tcpPacket2.eth.SrcMac2;
+	tcpPacket2.eth.DestMac3 = tcpPacket2.eth.SrcMac3;
+	tcpPacket2.eth.DestMac4 = tcpPacket2.eth.SrcMac4;
+	tcpPacket2.eth.DestMac5 = tcpPacket2.eth.SrcMac5;
+	tcpPacket2.eth.DestMac6 = tcpPacket2.eth.SrcMac6;
+	tcpPacket2.eth.SrcMac1 = _my_macaddr[0];
+	tcpPacket2.eth.SrcMac2 = _my_macaddr[1];
+	tcpPacket2.eth.SrcMac3 = _my_macaddr[2];
+	tcpPacket2.eth.SrcMac4 = _my_macaddr[3];
+	tcpPacket2.eth.SrcMac5 = _my_macaddr[4];
+	tcpPacket2.eth.SrcMac6 = _my_macaddr[5];
+	tcpPacket2.eth.Type.Value = 0x800;
+	
+    // See Rev 1 - Bug 1
+	//unsigned int tmpTotalLen = tcpPacket2.ip.TotalLength.Value;
+	
+	// IP Part
+	tcpPacket2.ip.Version.Value = 0x45;
+	tcpPacket2.ip.DscpEcn = 0;
+	tcpPacket2.ip.TotalLength.Value = TOTAL_HEADER_SIZE + _payload;
+	tcpPacket2.ip.Identification.Value = socket[i].idNum++;
+	tcpPacket2.ip.FragmentFlags.Bytes.ByteH = 0x40;
+	tcpPacket2.ip.FragmentFlags.Bytes.ByteL = 0x00;
+	tcpPacket2.ip.TimeToLive.Value = 64;
+	tcpPacket2.ip.Protocol.Value = 0x6;
+	tcpPacket2.ip.Checksum.Value = 0;
+	tcpPacket2.ip.DestIp1 = tcpPacket2.ip.SrcIp1;
+	tcpPacket2.ip.DestIp2 = tcpPacket2.ip.SrcIp2;
+	tcpPacket2.ip.DestIp3 = tcpPacket2.ip.SrcIp3;
+	tcpPacket2.ip.DestIp4 = tcpPacket2.ip.SrcIp4;
+	tcpPacket2.ip.SrcIp1 = _my_ipaddr[0];
+	tcpPacket2.ip.SrcIp2 = _my_ipaddr[1];
+	tcpPacket2.ip.SrcIp3 = _my_ipaddr[2];
+	tcpPacket2.ip.SrcIp4 = _my_ipaddr[3];
+	
+	// Inverting ports
+	unsigned int tmpDest = tcpPacket2.tcp.DestPort;
+	tcpPacket2.tcp.DestPort   = tcpPacket2.tcp.SourcePort;
+	tcpPacket2.tcp.SourcePort = tmpDest;
+	
+    // See Rev 1 - Bug 1
+    // SEQ/ACK numbers are treated 
+    // outside the function
+    tcpPacket2.tcp.SeqNum = socket[i].seqNumForSending;
+    tcpPacket2.tcp.AckNum = socket[i].ackNumForSending;
+
+	tcpPacket2.tcp.DataOffset.Bits.NibbleH = 0x5;
+	tcpPacket2.tcp.Flags.Value = 0x0;
+	tcpPacket2.tcp.Window = 0xFFFF;
+	tcpPacket2.tcp.Checksum.Value = 0;
+	tcpPacket2.tcp.UrgentPoint = 0;
+	
+	// Resolving flags and checksums
+	tcpPacket2.tcp.Flags.Bits.FlagACK = 1;
+    // See Rev 1 - Bug 2 (Issues)
+	//tcpPacket2.tcp.Flags.Bits.FlagPSH = 1;
+	
+	// calculate IP Header the checksum:
+	unsigned char *tmpInverter = (unsigned char*)&tcpPacket2;
+	unsigned char tmpHeader[IP_HEADER_LEN_V];
+	unsigned int counter2 = 0;
+	for(int k = TCP_BUFF_SIZE - ETH_BUFF_SIZE - 1;
+	k > TCP_BUFF_SIZE - ETH_BUFF_SIZE - IP_HEADER_LEN_V - 1; k--)
+	{
+		tmpHeader[counter2] = tmpInverter[k];
+		counter2++;
+	}
+	tcpPacket2.ip.Checksum.Value = meu_checksum(tmpHeader, IP_HEADER_LEN_V);
+	
+	// Getting data to send from socket's TX buffer
+	unsigned char buffWriter[_payload];
+	SOCKETReadBuffer((unsigned char*)buffWriter, _payload, socket[i].startTx + TCP_BUFF_SIZE + 1);
+	
+	// calculate TCP Header the checksum:
+	unsigned char *tmpTemp = (unsigned char*)&tcpPacket2;
+	unsigned char tmp[TCP_BUFF_SIZE + _payload];
+	for (unsigned int i = 0; i < _payload; i++)
+	{
+		tmp[i] = buffWriter[(_payload - 1) - i];
+	}
+	for (unsigned int i = 0; i < TCP_BUFF_SIZE; i++)
+	{
+		tmp[(_payload + i)] = tmpTemp[i]; //(TCP_BUFF_SIZE - 1) - i];
+	}
+	unsigned char tmpTcpHeader[TCP_HEADER_LEN_PLAIN_V + TCP_CHECKSUM_LEN_V + _payload];
+	counter2 = 0;
+	for(int k = (((TCP_BUFF_SIZE) - (IP_BUFF_SIZE - TCP_CHECKSUM_LEN_V) - 1) + _payload);
+	k >= (((TCP_BUFF_SIZE + _payload) - (IP_BUFF_SIZE - TCP_CHECKSUM_LEN_V))
+	- (TCP_CHECKSUM_LEN_V + TCP_HEADER_LEN_PLAIN_V + _payload)); k--)
+	{
+		tmpTcpHeader[counter2] = tmp[k];
+		counter2++;
+		if (!k) break;
+	}
+	tcpPacket2.tcp.Checksum.Value = checksum(tmpTcpHeader,
+	TCP_HEADER_LEN_PLAIN_V + TCP_CHECKSUM_LEN_V + _payload, CHECKSUMTCPID);
+	
+	// Write TCP Header to socket Tx Buffer
+	writeSocketBufferBigEndian((unsigned char*)&tcpPacket2, TCP_BUFF_SIZE, socket[i].startTx);
+}
+
+// New func - See Bug 2 - Rev 1
+// Send PSH data though socket
+//
+static void SendAckWithPayload(SOCKET i, unsigned int _payload)
+{
+	// DMA Copy from socket buffer to ENC28J60 TX buffer
+	// and send it!
+	// Header part
+	DMACopyFrom(TX, socket[i].startTx, TCP_BUFF_SIZE);
+	
+	// Wait for copy
+	WaitForDMACopy();
+	
+	// Data Part
+	unsigned char buffWriter[_payload];
+	SOCKETReadBuffer((unsigned char*)buffWriter, _payload, socket[i].startTx + TCP_BUFF_SIZE + 1);
+	
+	// Write data part
+	MACWriteTXBufferOffset((unsigned char*)&buffWriter, _payload, TCP_BUFF_SIZE);
+	
+	// Commiting send
+	SendBufferTx();
+}
+
 // Send ACK in response for PSH or FIN
 //
-static uint16_t SendAckResponse(SOCKET i)
+//static uint16_t SendAckResponse(SOCKET i)
+// See Bug 1 Rev 1
+static void SendAckResponse(SOCKET i)
 {
     // Load TCP struct 
-    readSocketBufferLittleEndian(socketBuffer, TCP_BUFF_SIZE, socket[i].startRx);
-    tcpPacket2 = (TCP_PACKET&)socketBuffer;
+    //readSocketBufferLittleEndian(socketBuffer, TCP_BUFF_SIZE, socket[i].startRx);
+    //tcpPacket2 = (TCP_PACKET&)socketBuffer;
+    //unsigned int ret_payload = tcpPacket2.ip.TotalLength.Value - TOTAL_HEADER_SIZE;
+    // Bug 1 Solve part 1
+    // deprecated -- see GetRequestPayload(SOCKET i)
     
-    unsigned int ret_payload = tcpPacket2.ip.TotalLength.Value - TOTAL_HEADER_SIZE;
+    //unsigned int ret_payload = GetRequestPayload(i);
     
     // ETH Part
     tcpPacket2.eth.DestMac1 = tcpPacket2.eth.SrcMac1;
@@ -1429,15 +1816,12 @@ static uint16_t SendAckResponse(SOCKET i)
     tcpPacket2.tcp.DestPort   = tcpPacket2.tcp.SourcePort;
     tcpPacket2.tcp.SourcePort = tmpDest;
     
-    // Inverting seq and ack numbers
-    // and adding 1 for computing ACK flag
-    unsigned long tmpSeq = tcpPacket2.tcp.SeqNum + (ret_payload != 0 ? ret_payload : 1);
-    if (tcpPacket2.tcp.AckNum != 0)
-        tcpPacket2.tcp.SeqNum = tcpPacket2.tcp.AckNum;
-    else
-        tcpPacket2.tcp.SeqNum = 3472621397ul;
-    tcpPacket2.tcp.AckNum = tmpSeq;
-    
+    // See Rev 1 - Bug 1
+    // Getting ACK/SEQ numbers from
+    // sockets array
+    tcpPacket2.tcp.SeqNum = socket[i].seqNumForSending;
+    tcpPacket2.tcp.AckNum = socket[i].ackNumForSending;
+
     tcpPacket2.tcp.DataOffset.Bits.NibbleH = 0x5;
     tcpPacket2.tcp.Flags.Value = 0x0;
     tcpPacket2.tcp.Window = 0xFFFF;
@@ -1480,142 +1864,8 @@ static uint16_t SendAckResponse(SOCKET i)
     // Commiting send
     SendBufferTx();
     
-    return ret_payload;
-}
-
-// Prepare PSH data to send it though socket
-//
-static void PreparePushRequest(SOCKET i, unsigned int _payload)
-{
-    // Load TCP struct 
-    readSocketBufferLittleEndian(socketBuffer, TCP_BUFF_SIZE, socket[i].startRx);
-    tcpPacket2 = (TCP_PACKET&)socketBuffer;
-    
-    // ETH Part
-    tcpPacket2.eth.DestMac1 = tcpPacket2.eth.SrcMac1;
-    tcpPacket2.eth.DestMac2 = tcpPacket2.eth.SrcMac2;
-    tcpPacket2.eth.DestMac3 = tcpPacket2.eth.SrcMac3;
-    tcpPacket2.eth.DestMac4 = tcpPacket2.eth.SrcMac4;
-    tcpPacket2.eth.DestMac5 = tcpPacket2.eth.SrcMac5;
-    tcpPacket2.eth.DestMac6 = tcpPacket2.eth.SrcMac6;
-    tcpPacket2.eth.SrcMac1 = _my_macaddr[0];
-    tcpPacket2.eth.SrcMac2 = _my_macaddr[1];
-    tcpPacket2.eth.SrcMac3 = _my_macaddr[2];
-    tcpPacket2.eth.SrcMac4 = _my_macaddr[3];
-    tcpPacket2.eth.SrcMac5 = _my_macaddr[4];
-    tcpPacket2.eth.SrcMac6 = _my_macaddr[5];
-    tcpPacket2.eth.Type.Value = 0x800;
-    
-    unsigned int tmpTotalLen = tcpPacket2.ip.TotalLength.Value;
-    
-    // IP Part
-    tcpPacket2.ip.Version.Value = 0x45;
-    tcpPacket2.ip.DscpEcn = 0;
-    tcpPacket2.ip.TotalLength.Value = TOTAL_HEADER_SIZE + _payload;
-    tcpPacket2.ip.Identification.Value = socket[i].idNum++;
-    tcpPacket2.ip.FragmentFlags.Bytes.ByteH = 0x40;
-    tcpPacket2.ip.FragmentFlags.Bytes.ByteL = 0x00;
-    tcpPacket2.ip.TimeToLive.Value = 64;
-    tcpPacket2.ip.Protocol.Value = 0x6;
-    tcpPacket2.ip.Checksum.Value = 0;
-    tcpPacket2.ip.DestIp1 = tcpPacket2.ip.SrcIp1;
-    tcpPacket2.ip.DestIp2 = tcpPacket2.ip.SrcIp2;
-    tcpPacket2.ip.DestIp3 = tcpPacket2.ip.SrcIp3;
-    tcpPacket2.ip.DestIp4 = tcpPacket2.ip.SrcIp4;
-    tcpPacket2.ip.SrcIp1 = _my_ipaddr[0];
-    tcpPacket2.ip.SrcIp2 = _my_ipaddr[1];
-    tcpPacket2.ip.SrcIp3 = _my_ipaddr[2];
-    tcpPacket2.ip.SrcIp4 = _my_ipaddr[3];
-    
-    // Inverting ports
-    unsigned int tmpDest = tcpPacket2.tcp.DestPort;
-    tcpPacket2.tcp.DestPort   = tcpPacket2.tcp.SourcePort;
-    tcpPacket2.tcp.SourcePort = tmpDest;
-    
-    // Inverting seq and ack numbers
-    // and adding 1 for computing ACK flag
-    unsigned long tmpSeq = tcpPacket2.tcp.SeqNum + (tmpTotalLen - TOTAL_HEADER_SIZE);
-    if (tcpPacket2.tcp.AckNum != 0)
-        tcpPacket2.tcp.SeqNum = tcpPacket2.tcp.AckNum;
-    else
-        tcpPacket2.tcp.SeqNum = 3472621397ul;
-    tcpPacket2.tcp.AckNum = tmpSeq;
-    
-    tcpPacket2.tcp.DataOffset.Bits.NibbleH = 0x5;
-    tcpPacket2.tcp.Flags.Value = 0x0;
-    tcpPacket2.tcp.Window = 0xFFFF;
-    tcpPacket2.tcp.Checksum.Value = 0;
-    tcpPacket2.tcp.UrgentPoint = 0;
-    
-    // Resolving flags and checksums
-    tcpPacket2.tcp.Flags.Bits.FlagACK = 1;
-    tcpPacket2.tcp.Flags.Bits.FlagPSH = 1;
-    
-    // calculate IP Header the checksum:
-    unsigned char *tmpInverter = (unsigned char*)&tcpPacket2;
-    unsigned char tmpHeader[IP_HEADER_LEN_V];
-    unsigned int counter2 = 0;
-    for(int k = TCP_BUFF_SIZE - ETH_BUFF_SIZE - 1;
-        k > TCP_BUFF_SIZE - ETH_BUFF_SIZE - IP_HEADER_LEN_V - 1; k--)
-    {
-        tmpHeader[counter2] = tmpInverter[k];
-        counter2++;
-    }
-    tcpPacket2.ip.Checksum.Value = meu_checksum(tmpHeader, IP_HEADER_LEN_V);
-    
-    // Getting data to send from socket's TX buffer
-    unsigned char buffWriter[_payload];
-    SOCKETReadBuffer((unsigned char*)buffWriter, _payload, socket[i].startTx + TCP_BUFF_SIZE + 1);
-    
-    // calculate TCP Header the checksum:
-    unsigned char *tmpTemp = (unsigned char*)&tcpPacket2;
-    unsigned char tmp[TCP_BUFF_SIZE + _payload];
-    for (unsigned int i = 0; i < _payload; i++)
-    {
-        tmp[i] = buffWriter[(_payload - 1) - i];
-    }
-    for (unsigned int i = 0; i < TCP_BUFF_SIZE; i++)
-    {
-        tmp[(_payload + i)] = tmpTemp[i]; //(TCP_BUFF_SIZE - 1) - i];
-    }
-    unsigned char tmpTcpHeader[TCP_HEADER_LEN_PLAIN_V + TCP_CHECKSUM_LEN_V + _payload];
-    counter2 = 0;
-    for(int k = (((TCP_BUFF_SIZE) - (IP_BUFF_SIZE - TCP_CHECKSUM_LEN_V) - 1) + _payload);
-        k >= (((TCP_BUFF_SIZE + _payload) - (IP_BUFF_SIZE - TCP_CHECKSUM_LEN_V))
-                    - (TCP_CHECKSUM_LEN_V + TCP_HEADER_LEN_PLAIN_V + _payload)); k--)
-    {
-        tmpTcpHeader[counter2] = tmp[k];
-        counter2++;
-        if (!k) break;
-    }
-    tcpPacket2.tcp.Checksum.Value = checksum(tmpTcpHeader,
-                TCP_HEADER_LEN_PLAIN_V + TCP_CHECKSUM_LEN_V + _payload, CHECKSUMTCPID);
-    
-    // Write TCP Header to socket Tx Buffer
-    writeSocketBufferBigEndian((unsigned char*)&tcpPacket2, TCP_BUFF_SIZE, socket[i].startTx);
-}
-
-// Send PSH data though socket
-//
-static void SendPushRequest(SOCKET i, unsigned int _payload)
-{
-    // DMA Copy from socket buffer to ENC28J60 TX buffer
-    // and send it!
-    // Header part
-    DMACopyFrom(TX, socket[i].startTx, TCP_BUFF_SIZE);
-    
-    // Wait for copy
-    WaitForDMACopy();
-    
-    // Data Part
-    unsigned char buffWriter[_payload];
-    SOCKETReadBuffer((unsigned char*)buffWriter, _payload, socket[i].startTx + TCP_BUFF_SIZE + 1);
-    
-    // Write data part
-    MACWriteTXBufferOffset((unsigned char*)&buffWriter, _payload, TCP_BUFF_SIZE);
-    
-    // Commiting send
-    SendBufferTx();
+    // See Bug 1 Rev1
+    //return ret_payload;
 }
 
 // Send Fin request
@@ -1665,15 +1915,11 @@ static void SendFinRequest(SOCKET i)
     tcpPacket2.tcp.DestPort   = tcpPacket2.tcp.SourcePort;
     tcpPacket2.tcp.SourcePort = tmpDest;
     
-    // Inverting seq and ack numbers
-    // and adding 1 for computing ACK flag
-    unsigned long tmpSeq = tcpPacket2.tcp.SeqNum;
-    if (tcpPacket2.tcp.AckNum != 0)
-        tcpPacket2.tcp.SeqNum = tcpPacket2.tcp.AckNum;
-    else
-        tcpPacket2.tcp.SeqNum = 3472621397ul;
-    tcpPacket2.tcp.AckNum = tmpSeq;
-    
+    // Rev 1
+    // ACK/SEQ Num
+    tcpPacket2.tcp.SeqNum = socket[i].seqNumForSending;
+    tcpPacket2.tcp.AckNum = socket[i].ackNumForSending;
+
     tcpPacket2.tcp.DataOffset.Bits.NibbleH = 0x5;
     tcpPacket2.tcp.Flags.Value = 0x0;
     tcpPacket2.tcp.Window = 0xFFFF;
@@ -1718,6 +1964,57 @@ static void SendFinRequest(SOCKET i)
     SendBufferTx();
 }
 
+
+// Get Payload from Socket Buffer
+//
+static uint16_t GetRequestPayload(SOCKET i)
+{
+    // Load TCP struct 
+    readSocketBufferLittleEndian(socketBuffer, TCP_BUFF_SIZE, socket[i].startRx);
+    tcpPacket2 = (TCP_PACKET&)socketBuffer;
+    
+    unsigned int ret_payload = tcpPacket2.ip.TotalLength.Value - TOTAL_HEADER_SIZE;
+    
+    return ret_payload;
+}
+
+// Get Source Port from Socket Buffer
+//
+static uint16_t GetSourcePort(SOCKET i)
+{
+    // Load TCP struct 
+    readSocketBufferLittleEndian(socketBuffer, TCP_BUFF_SIZE, socket[i].startRx);
+    tcpPacket2 = (TCP_PACKET&)socketBuffer;
+    
+    return tcpPacket2.tcp.SourcePort;
+}
+
+// See Rev 1 - Bug 1
+// Get SEQ number from Socket Buffer
+//
+static uint32_t GetRequestSeqNum(SOCKET i)
+{
+    // Load TCP struct 
+    readSocketBufferLittleEndian(socketBuffer, TCP_BUFF_SIZE, socket[i].startRx);
+    tcpPacket2 = (TCP_PACKET&)socketBuffer;
+    
+    unsigned long ret = (unsigned long)(tcpPacket2.tcp.SeqNum);
+    return ret;
+}
+
+// See Rev 1 - Bug 1
+// Get ACK number from Socket Buffer
+//
+static uint32_t GetRequestAckNum(SOCKET i)
+{
+    // Load TCP struct 
+    readSocketBufferLittleEndian(socketBuffer, TCP_BUFF_SIZE, socket[i].startRx);
+    tcpPacket2 = (TCP_PACKET&)socketBuffer;
+    
+    unsigned long ret = (unsigned long)(tcpPacket2.tcp.AckNum);
+    return ret;
+}
+
 // Wait for DMA Copy finish
 //
 static void WaitForDMACopy(void)
@@ -1731,11 +2028,11 @@ static void SendBufferTx(void)
 {
     MACSendTx();
 
-    timerTimeout2 = millis();
+    unsigned long timerSendTrigger = millis();
     
     while(!IsMACSendTx())
     {
-        if (timeout2(100))
+        if (timerSendTrigger + 100 < millis())
         {
             break;
         }
@@ -1745,25 +2042,162 @@ static void SendBufferTx(void)
 
 
 
-// Timeout control
+// Put Tx pointer 54 positions forward
+// to avoid TCP Head area
 //
-static uint8_t timeout(uint32_t delta)
+static void RecalcTxPointer(SOCKET i)
 {
-    uint8_t ret = ((timerTimeout + delta) < millis());
-    if (ret) timerTimeout = millis();
-    return ret;
+    // After confirming sending, recalc tx pointer
+    // Set TX pointer position
+    socket[i].ptrWrTx = socket[i].startTx + TCP_BUFF_SIZE + 1;
+    
+    // Configuring socket writer TX pointer
+    SOCKETSetTxPointer(socket[i].ptrWrTx);
 }
 
-static uint8_t timeout2(uint32_t delta)
+// Init SocketVal struct
+//
+static void InitSocket(SOCKET i)
 {
-    uint8_t ret = ((timerTimeout2 + delta) < millis());
-    if (ret) timerTimeout2 = millis();
-    return ret;
+    socket[i].ptrRdRx   = 0;
+    socket[i].ptrWrTx   = 0;
+    
+    socket[i].startRx   = 0;
+    socket[i].endRx     = 0;
+    socket[i].startTx   = 0;
+    socket[i].endTx     = 0;
+    
+    socket[i].idNum     = 322;
+    
+    socket[i].status = SnSR::CLOSED;
+    socket[i].sizeRx = 0;
+    
+
+    socket[i].myFlagNewSession = 0;
+    socket[i].myFlagGotSyncAck = 0;
+    socket[i].myFlagEstablished = 0;
+    socket[i].myFlagFoundNoSyncAck = 0;
+    socket[i].myFlagSendOk = 0;
+    socket[i].myFlagSendFinalACK = 0;
+    socket[i].myFlagSendFinalFIN = 0;
+    socket[i].myFlagSendCloseACK = 0;
+    socket[i].myFlagDoSend = 0;
+    socket[i].myFlagWaitForSyncAck = 0;
+    socket[i].myFlagDiscon = 0;
+    socket[i].myFlagLock = 0;
+
+    socket[i].requestPayload = 0;
+    socket[i].previousPayloadForSending = 0;
+    socket[i].sessionPort = 0;
+
+
+    // See Rev 1 - Bug 2
+    socket[i].ackNumForSending = 0;
+    socket[i].seqNumForSending = 0;
+
+    socket[i].loopCounter = 0;
 }
 
-static uint8_t timeout3(uint32_t delta)
+// Clear session part from SocketVal struct
+//
+static void ClearSocket(SOCKET i)
 {
-    uint8_t ret = ((timerTimeout3 + delta) < millis());
-    if (ret) timerTimeout3 = millis();
-    return ret;
+    socket[i].idNum     = 322;
+    
+    //socket[i].status = SnSR::CLOSED;
+    socket[i].sizeRx = 0;
+    
+
+    socket[i].myFlagNewSession = 0;
+    socket[i].myFlagGotSyncAck = 0;
+    socket[i].myFlagEstablished = 0;
+    socket[i].myFlagFoundNoSyncAck = 0;
+    socket[i].myFlagSendOk = 0;
+    socket[i].myFlagSendFinalACK = 0;
+    socket[i].myFlagSendFinalFIN = 0;
+    socket[i].myFlagSendCloseACK = 0;
+    socket[i].myFlagDoSend = 0;
+    socket[i].myFlagWaitForSyncAck = 0;
+    socket[i].myFlagDiscon = 0;
+    socket[i].myFlagLock = 0;
+    
+
+    socket[i].requestPayload = 0;
+    socket[i].previousPayloadForSending = 0;
+    socket[i].sessionPort = 0;
+
+
+    // See Rev 1 - Bug 2
+    socket[i].ackNumForSending = 0;
+    socket[i].seqNumForSending = 0;
+
+    socket[i].loopCounter = 0;
+    
+    
 }
+
+// Read and invert ENC28's RX buffer
+// This method mirror the buffer to swap
+// big endian integers in little endian
+//
+static void readBufferLittleEndian(unsigned char* buf, unsigned int size)
+{
+    unsigned char tmpBuf[size];
+    
+    MACReadRXBuffer(tmpBuf, size);
+    
+    for (unsigned int k = 0; k < size; k++)
+    {
+        buf[k] = tmpBuf[size - k - 1];
+    }
+}
+
+// Read and invert Socket RX buffer
+// This method mirror the buffer to swap
+// big endian integers in little endian
+//
+static void readSocketBufferLittleEndian(unsigned char* buf, unsigned int size, unsigned int start)
+{
+    unsigned char tmpBuf[size];
+    
+    SOCKETReadBuffer(tmpBuf, size, start);
+    
+    for (unsigned int k = 0; k < size; k++)
+    {
+        buf[k] = tmpBuf[size - k - 1];
+    }
+}
+
+// Read and invert Socket RX buffer
+// This method mirror the buffer to swap
+// big endian integers in little endian
+//
+static void writeSocketBufferBigEndian(unsigned char* buf, unsigned int size, unsigned int start)
+{
+    unsigned char tmpBuf[size];
+    
+    for (unsigned int k = 0; k < size; k++)
+    {
+        tmpBuf[k] = buf[size - k - 1];
+    }
+    
+    SOCKETWriteBuffer(tmpBuf, size, start);
+}
+
+
+// Write and invert TX buffer
+// This method mirror the buffer to swap 
+// little endian integers back into big endian
+//
+static void writeBufferBigEndian(unsigned char* buf, unsigned int size)
+{
+    unsigned char tmpBuf[size];
+    
+    for (unsigned int k = 0; k < size; k++)
+    {
+        tmpBuf[k] = buf[size - k - 1];
+    }
+    
+    MACWriteTXBuffer(tmpBuf, size);
+}
+

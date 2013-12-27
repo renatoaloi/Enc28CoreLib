@@ -14,7 +14,6 @@
 #define TOTAL_HEADER_SIZE        (TCP_BUFF_SIZE - ETH_BUFF_SIZE)
 
 
-
 // ******* ETH VALUES *******
 #define ETHTYPE_ARP_H_V          0x08
 #define ETHTYPE_ARP_L_V          0x06
@@ -281,16 +280,33 @@ public:
     
     uint16_t    idNum;
     uint8_t     status;         
-    uint16_t    sizeRx;         
-    uint8_t     pending;
+    uint16_t    sizeRx;
+
+
+
+    uint8_t     myFlagNewSession;
+    uint8_t     myFlagEstablished;
+    uint8_t     myFlagDoSend;
+    uint8_t     myFlagFoundNoSyncAck;
+    uint8_t     myFlagGotSyncAck;
+    uint8_t     myFlagWaitForSyncAck;
+    uint8_t     myFlagSendOk;
+    uint8_t     myFlagSendFinalACK;
+    uint8_t     myFlagSendFinalFIN;
+    uint8_t     myFlagSendCloseACK;
+    uint8_t     myFlagDiscon;
+    uint8_t     myFlagLock;
     
-    uint8_t     myFlagSYN;
-    uint8_t     myFlagFIN;
-    uint8_t     myFlagPSH;
-    uint8_t     myFlagPSHACK;
-    uint8_t     myFlagACKFromPush;
-    
+
+    uint16_t    requestPayload;
+    uint16_t    previousPayloadForSending;
     uint16_t    sessionPort;  
+
+    uint32_t    ackNumForSending;
+    uint32_t    seqNumForSending;
+
+    uint16_t    loopCounter;
+    
 };
 
 
