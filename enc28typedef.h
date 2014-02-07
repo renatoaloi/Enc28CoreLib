@@ -260,7 +260,7 @@
 #define SOCKET2_TX_END       0x1FFE
 
 #define SOCKET_TX_START(a)  ((a != 0) ? ((a != 1) ? 0 : 0x1C03) : 0x1803)
-#define SOCKET_TX_END(a)    ((a != 0) ? ((a != 1) ? 0 : 0x1C02) : 0x1FFE)
+#define SOCKET_TX_END(a)    ((a != 0) ? ((a != 1) ? 0 : 0x1FFE) : 0x1C02)
 #define SOCKET_TX_LEN(a)    (SOCKET_TX_END(a) - SOCKET_TX_START(a) + 1)
 
 // start RX socket 1 buffer

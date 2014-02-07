@@ -420,7 +420,7 @@ void MACWriteTXBuffer(unsigned char* _buf, unsigned int _size)
 void MACWriteTXBufferOffset(unsigned char* _buf, unsigned int _size, unsigned int offset_len)
 {
     // calc offset
-    unsigned int offsetStart  = TXSTART_INIT + offset_len;
+    /*unsigned int offsetStart  = TXSTART_INIT + offset_len;
     unsigned int offsetEnd    = offsetStart + _size; 
     
     // Set the write pointer to start of transmit buffer area
@@ -434,6 +434,50 @@ void MACWriteTXBufferOffset(unsigned char* _buf, unsigned int _size, unsigned in
     // write per-packet control byte (0x00 means use macon3 settings)
     enc28j60WriteOp(ENC28J60_WRITE_BUF_MEM, 0, 0x00);
     
+    // copy the packet into the transmit buffer
+    enc28j60WriteBuffer(_size, _buf);*/
+
+    MACWriteTXBufferOffset2(_buf, _size, offset_len, 0);
+}
+
+/******************************************************************************
+ * Function:        void MACWriteTXBufferOffset2(uint8_t* _buf, uint16_t _size, uint16_t offset_len, uint16_t offset_val)
+ *
+ * PreCondition:    none
+ *
+ * Input:           *_buf: buffer to write data 
+ *                  _size: amount data to write
+ *                  offset_len:memory pointer to write data
+ *                  offset_val:incremental offset
+ *
+ * Output:          None
+ *
+ * Side Effects:    None
+ *
+ * Overview:        Writes bytes to TX Buffer space and skips offset
+ *
+ * Note:            None
+ *****************************************************************************/
+void MACWriteTXBufferOffset2(uint8_t* _buf, uint16_t _size, uint16_t offset_len, uint16_t offset_val)
+{
+    // calc offset
+    unsigned int offsetStart  = TXSTART_INIT + offset_len;
+    unsigned int offsetEnd    = offsetStart + _size; 
+    
+    // Set the write pointer to start of transmit buffer area
+    enc28j60Write(EWRPTL, low(offsetStart));
+    enc28j60Write(EWRPTH, high(offsetStart));
+    
+    // Set the TXND pointer to correspond to the packet size given
+    enc28j60Write(ETXNDL, low(offsetEnd));
+    enc28j60Write(ETXNDH, high(offsetEnd));
+    
+    // write per-packet control byte (0x00 means use macon3 settings)
+    if (!offset_val)
+    {
+        enc28j60WriteOp(ENC28J60_WRITE_BUF_MEM, 0, 0x00);
+    }
+
     // copy the packet into the transmit buffer
     enc28j60WriteBuffer(_size, _buf);
 }

@@ -1,5 +1,8 @@
 #include <stdint.h>
 
+#ifndef ENC28SOCKET_H_INCLUDED
+#define ENC28SOCKET_H_INCLUDED
+
 #define MAX_SOCK_NUM             1
 #define CHECKSUMTCPID            2
 
@@ -12,6 +15,7 @@
 #define MAX_BUFF_SIZE            98
 
 #define TOTAL_HEADER_SIZE        (TCP_BUFF_SIZE - ETH_BUFF_SIZE)
+#define TCP_HEADER_SIZE          (TCP_BUFF_SIZE - IP_BUFF_SIZE)
 
 
 // ******* ETH VALUES *******
@@ -266,52 +270,6 @@ typedef struct
 } TCP_PACKET_W_OPT;
 
 
-class SocketVal
-{
-public:
-    
-    uint16_t    ptrWrTx;
-    uint16_t    ptrRdRx;
-    
-    uint16_t    startRx;
-    uint16_t    endRx;
-    uint16_t    startTx;
-    uint16_t    endTx;
-    
-    uint16_t    idNum;
-    uint8_t     status;         
-    uint16_t    sizeRx;
-
-
-
-    uint8_t     myFlagNewSession;
-    uint8_t     myFlagEstablished;
-    uint8_t     myFlagDoSend;
-    uint8_t     myFlagFoundNoSyncAck;
-    uint8_t     myFlagGotSyncAck;
-    uint8_t     myFlagWaitForSyncAck;
-    uint8_t     myFlagSendOk;
-    uint8_t     myFlagSendFinalACK;
-    uint8_t     myFlagSendFinalFIN;
-    uint8_t     myFlagSendCloseACK;
-    uint8_t     myFlagDiscon;
-    uint8_t     myFlagLock;
-    
-
-    uint16_t    requestPayload;
-    uint16_t    previousPayloadForSending;
-    uint16_t    sessionPort;  
-
-    uint32_t    ackNumForSending;
-    uint32_t    seqNumForSending;
-
-    uint16_t    loopCounter;
-    
-};
-
-
-
-
 class SnMR {
 public:
     static const uint8_t CLOSE  = 0x00;
@@ -378,3 +336,5 @@ public:
     static const uint8_t RAW  = 255;
 };
 
+
+#endif
