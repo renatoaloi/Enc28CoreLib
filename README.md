@@ -1,6 +1,13 @@
 Enc28CoreLib
 ============
 
+AUG 2015
+-----------
+Deprecated: Merged into EtherEncLib
+https://github.com/renatoaloi/EtherEncLib/
+-----------
+
+
 ENC28J60 TCP Stack Library for Atmel megaAVR series
 
 This Enc28j60 library differ from others, including EtherEncLib.h, because
